@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>꼬물이 키우기</title>
+    <style>
+      /* 청중의 휴대폰 화면. 가볍게 뜨도록 글꼴과 그림을 쓰지 않는다. 글자는 크게, 안내 문구는 없이. */
+      * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        display: flex; flex-direction: column;
+        background: #0e2526; color: #fff3cf;
+        font-family: -apple-system, BlinkMacSystemFont, 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
+        font-weight: 800; text-align: center; word-break: keep-all;
+      }
+      main { flex: 1; display: flex; flex-direction: column; justify-content: center; padding: 22px; }
+      h1 { margin: 0 0 26px; font-size: 40px; }
+      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; flex: 1; }
+      button {
+        border: 3px solid #b99a5b; background: #6b2a1e; color: #fff3cf;
+        font: inherit; font-size: 96px; min-height: 120px;
+      }
+      button:active { background: #d2601f; }
+      button.on { background: #ecd9a0; color: #1a1a1a; border-color: #fff; }
+      button:disabled { opacity: 0.2; }
+      .teams button { font-size: 72px; }
+      .bar { height: 12px; background: rgba(236, 217, 160, 0.2); margin-bottom: 20px; }
+      .bar div { height: 100%; background: #ecd9a0; width: 100%; }
+      .huge { font-size: 30vw; line-height: 1; }
+      .huge small { display: block; margin-top: 10px; font-size: 9vw; color: rgba(236, 217, 160, 0.75); }
+      ol { list-style: none; padding: 0; margin: 0; font-size: 34px; text-align: left; }
+      li { display: flex; justify-content: space-between; padding: 18px 14px; border-bottom: 2px solid rgba(236, 217, 160, 0.25); }
+      li.me { background: #ecd9a0; color: #1a1a1a; }
+      .ref { min-height: 0; margin-bottom: 16px; padding: 12px; font-size: 26px; background: transparent; border-width: 2px; }
+      table { width: 100%; border-collapse: collapse; font-size: 17px; font-weight: 600; line-height: 1.35; }
+      th, td { border: 1px solid rgba(236, 217, 160, 0.5); padding: 9px 6px; }
+      thead th { background: #6b2a1e; }
+      tbody th { color: #ecd9a0; white-space: nowrap; }
+    </style>
+  </head>
+  <body>
+    <main id="main"></main>
+    <script src="./mqtt.min.js"></script>
+    <script>
+      // 주소에 담겨 온 값: r = 방 번호, t = 모둠 수, b = 중계 서버 주소
+      const params = new URLSearchParams(location.search);
+      const room = params.get('r');
+      const teams = Number(params.get('t')) || 6;
+      const broker = params.get('b') || 'wss://broker.emqx.io:8084/mqtt';
+      const main = document.getElementById('main');
+
+      // 참여자 구분용 임의 번호 (이름 등 개인 정보는 쓰지 않는다)
+      const me = localStorage.getItem('kkomuri-me') || Math.random().toString(36).slice(2, 10);
+      localStorage.setItem('kkomuri-me', me);
+      let team = Number(localStorage.getItem('kkomuri-team-' + room)) || 0;
+      let state = { phase: 'idle' };
+      let myChoice = {}; // 문제별로 내가 고른 번호
+      let localEnd = 0;
+      let client = null;
+      let showRef = false; // 참고 표를 펼쳐 보고 있는지
+
+      const el = (tag, props, children) => {
+        const node = Object.assign(document.createElement(tag), props || {});
+        (children || []).forEach((c) => node.append(c));
+        return node;
+      };
+
+      // 발표 화면의 참여 명단에 표시되도록 내 모둠을 알린다
+      function announce() {
+        if (client && team) client.publish(`kkomuri/v1/${room}/join/${me}`, JSON.stringify({ team }), { qos: 1 });
+      }
+
+      function vote(index) {
+        myChoice[state.qid] = index;
+        client.publish(`kkomuri/v1/${room}/vote/${me}`, JSON.stringify({ qid: state.qid, team, choice: index }), { qos: 1 });
+        render();
+      }
+
+      function render() {
+        main.replaceChildren();
+        if (!room) return main.append(el('h1', { textContent: 'QR코드로 접속해 주세요' }));
+
+        // 1) 모둠 고르기
+        if (!team) {
+          main.append(el('h1', { textContent: '몇 모둠?' }));
+          const grid = el('div', { className: 'grid teams' });
+          for (let i = 1; i <= teams; i++) {
+            grid.append(el('button', { textContent: String(i), onclick: () => { team = i; localStorage.setItem('kkomuri-team-' + room, i); announce(); render(); } }));
+          }
+          return main.append(grid);
+        }
+
+        // 2) 투표 중: 번호만 크게
+        if (state.phase === 'vote') {
+          const bar = el('div', { className: 'bar' }, [el('div', { id: 'fill' })]);
+          // 참고 표(예: 아프가 채점표)가 있으면 이름을 눌러 펼쳐 본다. 다시 누르면 번호로 돌아간다.
+          if (state.ref) {
+            const toggle = el('button', { className: 'ref', textContent: showRef ? '번호 고르기' : state.ref.title, onclick: () => { showRef = !showRef; render(); } });
+            if (showRef) {
+              const table = el('table');
+              table.append(el('thead', {}, [el('tr', {}, state.ref.columns.map((c) => el('th', { textContent: c })))]));
+              table.append(el('tbody', {}, state.ref.rows.map((row) => el('tr', {}, row.map((cell, i) => el(i === 0 ? 'th' : 'td', { textContent: cell }))))));
+              return main.append(bar, toggle, table);
+            }
+            main.append(bar, toggle);
+          } else {
+            main.append(bar);
+          }
+          const grid = el('div', { className: 'grid' });
+          for (let i = 0; i < state.n; i++) {
+            grid.append(el('button', {
+              textContent: String(i + 1),
+              className: myChoice[state.qid] === i ? 'on' : '',
+              disabled: (state.disabled || []).includes(i) || Date.now() > localEnd,
+              onclick: () => vote(i),
+            }));
+          }
+          return main.append(grid);
+        }
+
+        // 3) 최종 순위
+        if (state.phase === 'final' && state.ranking) {
+          const list = el('ol');
+          state.ranking.filter((r) => r.voters > 0).forEach((r, i) => {
+            list.append(el('li', { className: r.team === team ? 'me' : '' }, [
+              el('span', { textContent: (i + 1) + '위 ' + r.team + '모둠' }),
+              el('span', { textContent: r.score.toFixed(1) + '점' }),
+            ]));
+          });
+          return main.append(list);
+        }
+
+        // 4) 그 밖에는 단색 바탕에 모둠 번호만. 번호를 누르면 모둠을 다시 고를 수 있다.
+        main.append(el('div', { className: 'huge', onclick: () => { team = 0; render(); } }, [String(team), el('small', { textContent: '모둠' })]));
+      }
+
+      // 남은 시간 막대
+      setInterval(() => {
+        const fill = document.getElementById('fill');
+        if (!fill || state.phase !== 'vote') return;
+        const total = (state.endsAt - state.sentAt) || 1;
+        const left = Math.max(0, localEnd - Date.now());
+        fill.style.width = Math.min(100, (left / total) * 100) + '%';
+        if (left === 0 && !fill.dataset.done) { fill.dataset.done = '1'; render(); }
+      }, 200);
+
+      if (room) {
+        client = mqtt.connect(broker, { reconnectPeriod: 2000 });
+        client.on('connect', () => { client.subscribe(`kkomuri/v1/${room}/state`, { qos: 1 }); announce(); });
+        client.on('message', (topic, payload, packet) => {
+          try {
+            const before = state.qid;
+            state = JSON.parse(payload.toString());
+            if (state.qid !== before) showRef = false;
+            // 휴대폰 시계가 발표 PC와 조금 달라도 남은 시간이 맞도록 보정한다
+            const skew = packet.retain ? 0 : Date.now() - (state.sentAt || Date.now());
+            localEnd = (state.endsAt || 0) + skew;
+            render();
+          } catch (e) { /* 형식이 맞지 않으면 무시 */ }
+        });
+      }
+      render();
+    </script>
+  </body>
+</html>
